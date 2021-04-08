@@ -15,6 +15,7 @@ chrome.runtime.sendMessage({
 })
 
 const { parseDomain, ParseResultType } = require('parse-domain')
+import {ElementPickerEvents} from './elementPickerEvents'
 
 // Start looking for things to unhide before at most this long after
 // the backend script is up and connected (eg backgroundReady = true),
@@ -584,6 +585,236 @@ const scheduleQueuePump = (hide1pContent: boolean, generichide: boolean) => {
 
 const vettedSearchEngines = ['duckduckgo', 'qwant', 'bing', 'startpage', 'google', 'yandex', 'ecosia']
 
+let pickerFrame: HTMLIFrameElement | null;
+const picker = new ElementPickerEvents(
+  // On element hover
+  (selected: Element) => {
+    const rect = selected.getBoundingClientRect()
+    const coords = {
+      x: rect.left,
+      y: rect.top,
+      width: rect.right - rect.left,
+      height: rect.bottom  - rect.top
+    }
+
+    // Chromium supports sending messages from content script to content script,
+    // so this will show up in the web accessible resource listener.
+    chrome.runtime.sendMessage({ type: 'highlightElement', coords: coords })
+  },
+
+  // On element click
+  async (selected: Element) => {
+    console.log("selected:", selected)
+    let elem: Element | null = selected
+    const selectorBuilders = []
+    while (elem !== null && elem !== document.body) {
+      selectorBuilders.push(cssSelectorFromElement(elem))
+      elem = elem.parentElement
+    }
+
+    for (const b of selectorBuilders) {
+      console.log("out:", b.toString())
+    }
+    // TODO: insert the body if using nth-type-of
+  },
+
+  // On picker deactivated
+  () => {
+    if (pickerFrame !== null) {
+      document.documentElement.removeChild(pickerFrame!)
+    }
+  }
+);
+
+enum Selector {
+  Id,
+  Class,
+  Attributes,
+  NthOfType
+}
+
+interface Rule {
+  type: Selector;
+  value: any;
+}
+
+class ElementSelectorBuilder {
+  private elem: Element;
+  private rules: Rule[];
+  private tag: string
+
+  constructor(elem: Element) {
+    this.rules = []
+    this.tag = ''
+    this.elem = elem
+  }
+
+  addRule(rule: Rule): void {
+    if (rule.type < Selector.Id || rule.type > Selector.NthOfType) {
+      console.log(`Unexpected selector: ${rule.type}`)
+      return
+    }
+    if (Array.isArray(rule.value) && rule.value.length === 0) {
+      return;
+    }
+    this.rules.push(rule)
+  }
+
+  addTag(tag: string): void {
+    console.log('adding tag:', tag)
+    this.tag = tag
+  }
+
+  size(): number {
+    return this.rules.length
+  }
+
+  toString(): string {
+    let selector = this.tag + ''
+    for (const rule of this.rules) {
+      switch (rule.type) {
+        case Selector.Id: {
+          selector += '#' + rule.value
+          break
+        }
+        case Selector.Class: {
+          selector += '.' + rule.value.join('.')
+          break
+        }
+        case Selector.Attributes: {
+          for (const attribute of rule.value) {
+            const sourceAttr = this.elem.getAttribute(attribute.attr)
+            let op = "*="
+            if (attribute.attr === sourceAttr) {
+              op = "="
+            } else if (attribute.attr.startsWith(sourceAttr)) {
+              op = "^="
+            }
+            selector += `[${attribute.attr}${op}"${attribute.value}"]`
+          }
+          break
+        }
+        case Selector.NthOfType: {
+          // NOTE: this selector is not valid without calling addTag(..)
+          selector += `:nth-of-type(${rule.value})`
+          break
+        }
+        default: { /* Unreachable */ }
+      }
+    }
+    return selector
+  }
+}
+
+// We search for a CSS selector for the target element. We want the most specific identifiers.
+const cssSelectorFromElement = (elem: Element): ElementSelectorBuilder => {
+  const builder = new ElementSelectorBuilder(elem)
+
+  // ID
+  if (elem.id !== undefined && elem.id.length > 0) {
+    builder.addRule({
+      type: Selector.Id,
+      value: elem.id
+    })
+  }
+
+  // Class names
+  if (elem.classList.length > 0) {
+    builder.addRule({
+      type: Selector.Class,
+      value: [...elem.classList].map((c: string) => CSS.escape(c))
+    })
+  }
+
+  const tag = CSS.escape(elem.localName)
+
+  // Attributes. Only try these if we have no matches.
+  if (builder.size() === 0) {
+    const attributes = []
+    switch(tag) {
+      case 'a': {
+        // Get URL, removing query parameters and hash
+        const url = elem.getAttribute('href')?.trim().split(/[?#]/)[0]
+        if (url !== undefined && url.length > 0) {
+          attributes.push({
+            attr: 'href',
+            value: url,
+          })
+        }
+        break
+      }
+      case 'iframe': {
+        const url = elem.getAttribute('src')?.trim()
+        if (url !== undefined && url.length > 0) {
+          attributes.push({
+            attr: 'src',
+            value: url.slice(0, 256)
+          })
+        }
+        break
+      }
+      case 'img': {
+        let data = elem.getAttribute('src')?.trim()
+        if (data !== undefined && data.length > 0) {
+          // https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/Data_URIs
+          if (data.startsWith('data:')) {
+            data = data.split(',')[1].slice(0, 256)
+          }
+        }
+        if (data === undefined || data.length === 0) {
+          let alttext = elem.getAttribute('alt')?.trim()
+          if (alttext !== undefined && alttext.length > 0) {
+            attributes.push({
+              attr: 'alt',
+              value: alttext
+            })
+          }
+        } else {
+          attributes.push({
+            attr: 'src',
+            value: data
+          })
+        }
+        break
+      }
+      default: { break }
+    }
+    if (attributes.length > 0) {
+      builder.addRule({
+        type: Selector.Attributes,
+        value: attributes
+      })
+    }
+  }
+
+  const querySelectorNoExcept = (node: Element | null, selector: string): Element[] => {
+    if (node !== null) {
+      try {
+        let r = node.querySelectorAll(selector)
+        return Array.from(r)
+      } catch(e) {}
+    }
+    return []
+  }
+
+  if (builder.size() === 0 || querySelectorNoExcept(elem.parentElement, builder.toString()).length > 1) {
+    builder.addTag(tag)
+    if (querySelectorNoExcept(elem.parentElement, builder.toString()).length > 1) {
+      let index = 1
+      let sibling: Element | null = elem
+      while (sibling) {
+        sibling = sibling.previousElementSibling
+        index++
+      }
+      builder.addRule({
+        type: Selector.NthOfType,
+        value: index
+      })
+    }
+  }
+  return builder
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const action = typeof msg === 'string' ? msg : msg.type
   switch (action) {
@@ -621,6 +852,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       scheduleQueuePump(false, false)
       break
+    }
+    case 'launchElementPicker': {
+      pickerFrame = document.createElement('iframe')
+      // We ensure src is a web accessible resource since the URI is chrome://
+      // This ensures a malicious page cannot modify the iframe contents.
+      pickerFrame.src = chrome.runtime.getURL('elementPicker.html')
+      const pickerCSSStyle: string = [
+        'background: transparent',
+        'border: 0',
+        'border-radius: 0',
+        'box-shadow: none',
+        'display: block',
+        'height: 100%',
+        'left: 0',
+        'margin: 0',
+        'max-height: none',
+        'max-width: none',
+        'opacity: 1',
+        'outline: 0',
+        'padding: 0',
+        'pointer-events: none', // we need the hover events for elements under the iframe
+        'position: fixed',
+        'top: 0',
+        'visibility: visible',
+        'width: 100%',
+        'z-index: 2147483647',
+        ''
+      ].join(' !important;');
+      // TODO(keur): To harden this we can use chrome.tabs.insertCSS(). Not a
+      // big priority since the page can always remove the iframe if it wants.
+      pickerFrame.style.cssText = pickerCSSStyle
+
+      // We don't append to the body because we are setting the frame's
+      // width and height to be 100%. Prevents the picker from only being
+      // able to hover the iframe.
+      document.documentElement.appendChild(pickerFrame)
+      picker.activate()
+      break;
     }
   }
 })

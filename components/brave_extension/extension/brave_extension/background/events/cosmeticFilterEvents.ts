@@ -26,6 +26,12 @@ chrome.contextMenus.create({
   parentId: 'brave',
   contexts: ['all']
 })
+chrome.contextMenus.create({
+  title: getLocale('elementPickerMode'),
+  id: 'elementPickerMode',
+  parentId: 'brave',
+  contexts: ['all']
+})
 // context menu listener emit event -> query -> tabsCallback -> onSelectorReturned
 
 chrome.contextMenus.onClicked.addListener((info: chrome.contextMenus.OnClickData, tab: chrome.tabs.Tab) => {
@@ -82,6 +88,14 @@ export function onContextMenuClicked (info: chrome.contextMenus.OnClickData, tab
     case 'manageCustomFilters':
       openFilterManagementPage()
       break
+    case 'elementPickerMode': {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs: [chrome.tabs.Tab]) => {
+        if (tabs.length > 0) {
+          chrome.tabs.sendMessage(tabs[0].id!, { type: 'launchElementPicker' }, (x: any) => {})
+        }
+      })
+      break;
+    }
     default: {
       console.warn('[cosmeticFilterEvents] invalid context menu option: ${info.menuItemId}')
     }
